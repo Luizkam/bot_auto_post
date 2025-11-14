@@ -5,8 +5,8 @@ Versão turbinada do bot de ofertas:
 - inclui InlineKeyboard com botões
 - detecta cupons heurísticos
 - aplica link de afiliado simples (via .env)
-- registra stats e expõe /stats
-- roda também um webserver mínimo para ser deployado como Web Service (Render)
+- registra stats e expõe /stats e /health
+- roda um webserver mínimo para deploy em Web Service
 """
 
 import os
@@ -26,20 +26,19 @@ from dotenv import load_dotenv
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 load_dotenv()
 
-# config from env
+# ----------------- Config -----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID")
 DB_PATH = os.getenv("DB_PATH", "offers.db")
 POST_INTERVAL_SECONDS = int(os.getenv("POST_INTERVAL_SECONDS", 60 * 30))
-AFF_AMAZON_TAG = os.getenv("AFF_AMAZON_TAG")  # exemplo: meu-tag-20
-AFF_KABUM = os.getenv("AFF_KABUM")           # se tiver
-AFF_PICHAU = os.getenv("AFF_PICHAU")         # se tiver
+AFF_AMAZON_TAG = os.getenv("AFF_AMAZON_TAG")
+AFF_KABUM = os.getenv("AFF_KABUM")
+AFF_PICHAU = os.getenv("AFF_PICHAU")
 
-# basic sources kept (collectors also use specific pages)
+# Example fallback sources (you can edit)
 SOURCES = ["https://www.promodo.com.br/feed/"]
 
 # ----------------- DB helpers -----------------
@@ -125,9 +124,12 @@ async def fetch_text(url: str, session: ClientSession, timeout=20) -> Optional[s
     try:
         async with session.get(url, timeout=timeout) as resp:
             if resp.status != 200:
+                # debug log
+                print(f"fetch_text: {url} -> status {resp.status}")
                 return None
             return await resp.text()
-    except Exception:
+    except Exception as e:
+        print("fetch_text error", url, e)
         return None
 
 def clean_text(t: Optional[str]) -> Optional[str]:
@@ -179,7 +181,7 @@ def apply_affiliate(link: str, shop: Optional[str]) -> str:
         pass
     return link
 
-# ----------------- Extraction helpers (title/link/image) -----------------
+# ----------------- Extraction helpers -----------------
 BAD_TITLES = {
     "ir para o conteúdo principal", "ir para o conteúdo", "ir para o contéudo principal",
     "skip to main content", "skip to content", "ir para o conteúdo principal »"
@@ -235,7 +237,7 @@ def find_link_title_image(elem, base_url: Optional[str] = None):
 
     return title, link, image
 
-# ----------------- Collectors: Kabum / Pichau / Amazon (improved) -----------------
+# ----------------- Collectors -----------------
 async def collect_kabum(session: ClientSession):
     urls = [
         "https://www.kabum.com.br/ofertas/ofertaskabum",
@@ -400,7 +402,12 @@ async def post_offers_loop(bot: Bot):
                 keyboard = make_offer_keyboard(offer['url'], offer.get("shop"))
                 try:
                     if offer.get("image_url"):
-                        await bot.send_photo(chat_id=TARGET_CHAT_ID, photo=offer['image_url'], caption=caption, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+                        # send photo - fallback to message if fails
+                        try:
+                            await bot.send_photo(chat_id=TARGET_CHAT_ID, photo=offer['image_url'], caption=caption, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+                        except TelegramError as te_photo:
+                            print("send_photo failed, falling back to send_message:", te_photo)
+                            await bot.send_message(chat_id=TARGET_CHAT_ID, text=caption, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                     else:
                         await bot.send_message(chat_id=TARGET_CHAT_ID, text=caption, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                     mark_as_posted(offer["id"])
@@ -414,20 +421,20 @@ async def post_offers_loop(bot: Bot):
             print("Erro no post_offers_loop:", e)
             await asyncio.sleep(10)
 
-# ----------------- Bot commands -----------------
-async def cmd_stats(update: "Update", context: ContextTypes.DEFAULT_TYPE):
-    total, posted, unposted = stats_counts()
-    text = f"📊 Stats do bot:\nTotal coletadas: {total}\nJá postadas: {posted}\nAguardando postagem: {unposted}"
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=text)
-
-# ----------------- Webserver (health) -----------------
+# ----------------- Webserver (health + stats) -----------------
 async def handle_health(request):
     return web.Response(text="OK")
+
+async def handle_stats(request):
+    total, posted, unposted = stats_counts()
+    data = {"total": total, "posted": posted, "unposted": unposted}
+    return web.json_response(data)
 
 async def start_webserver(port: int):
     aio_app = web.Application()
     aio_app.router.add_get("/", handle_health)
     aio_app.router.add_get("/health", handle_health)
+    aio_app.router.add_get("/stats", handle_stats)
     runner = web.AppRunner(aio_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
@@ -440,10 +447,6 @@ async def main():
         raise SystemExit("Configure TELEGRAM_TOKEN e TARGET_CHAT_ID no .env")
     init_db()
 
-    # build app and register handlers
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("stats", cmd_stats))
-
     bot = Bot(token=TELEGRAM_TOKEN)
 
     async def periodic_collect():
@@ -455,18 +458,8 @@ async def main():
                 print("Erro coletor:", e)
             await asyncio.sleep(60 * 10)  # coleta a cada 10 minutos
 
-    # porta do ambiente (Render usa PORT)
     port = int(os.environ.get("PORT", "10000"))
 
-    # initialize and start the telegram Application (so /stats works)
-    await app.initialize()
-    await app.start()
-    # start polling so the bot responds to /stats
-    # app.updater exists inside Application; start polling
-    if hasattr(app, "updater") and app.updater:
-        await app.updater.start_polling()
-
-    # run webserver + collectors + poster in parallel
     await asyncio.gather(
         start_webserver(port),
         periodic_collect(),
