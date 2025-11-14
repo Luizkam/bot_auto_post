@@ -1,12 +1,11 @@
 # bot_auto_post.py
 """
-Bot de ofertas (versão filtrada só componentes):
-- envia imagens quando disponíveis
-- buttons com afiliado
-- filtra SOMENTE componentes/peças de computador (GPU, SSD, RAM, etc.)
-- ignora explicitamente títulos/promos (Oferta, Black Friday, % off, desconto)
-- tenta buscar título real do produto, mas NÃO substitui por títulos promocionais
-- mensagens curtas e limpas
+Bot de ofertas (versão: somente componentes)
+- posta apenas peças/componentes de computador (GPU, SSD, RAM, CPU, etc.)
+- ignora títulos promocionais, tenta buscar título real na página (og:title/h1/title)
+- só posta se houver preço detectado
+- mensagens curtas (formato solicitado)
+- roda um webserver minimal (health + stats) para deploy em Render
 """
 
 import os
@@ -33,12 +32,13 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID")
 DB_PATH = os.getenv("DB_PATH", "offers.db")
-POST_INTERVAL_SECONDS = int(os.getenv("POST_INTERVAL_SECONDS", 60))  # 20 minutos
+# default 20 minutes
+POST_INTERVAL_SECONDS = int(os.getenv("POST_INTERVAL_SECONDS", str(60 * 20)))
 AFF_AMAZON_TAG = os.getenv("AFF_AMAZON_TAG")
 AFF_KABUM = os.getenv("AFF_KABUM")
 AFF_PICHAU = os.getenv("AFF_PICHAU")
 
-SOURCES = ["https://www.promodo.com.br/feed/"]
+SOURCES = ["https://www.promodo.com.br/feed/"]  # fallback
 
 # ----------------- FILTER (peças/componentes) -----------------
 DEFAULT_FILTER_KEYWORDS = [
@@ -49,15 +49,7 @@ DEFAULT_FILTER_KEYWORDS = [
     "processador", "cpu", "cooler", "dissipador", "heatsink",
     "fonte", "psu", "gabinete", "case", "ventoinha", "fan",
     "placa de som", "placa de rede", "ssd nvme", "ssd sata", "ssd m2", "m.2 ssd",
-    "memoria", "memória", "nvme ssd"
-]
-
-# tokens que indicam conteúdo promocional/marketing (devemos IGNORAR)
-PROMO_TOKENS = [
-    "oferta", "ofertas", "promo", "promoção", "promoções", "black friday", "desconto",
-    "% off", "off%", "percent off", "cupom", "frete", "fretegratis", "frete grátis",
-    "flash sale", "imperdível", "super oferta", "mega oferta", "liquida", "liquidação",
-    "blackweek"
+    "memoria", "memória", "nvme ssd", "ssd nvme"
 ]
 
 DEFAULT_FILTER_BLACKLIST = [
@@ -65,6 +57,14 @@ DEFAULT_FILTER_BLACKLIST = [
     "televis", "tv", "geladeira", "airfryer", "console", "cadeira", "cadeirão",
     "game", "jogo", "figurine", "funko", "roupa", "sapato", "tênis", "tenis",
     "power bank", "powerbank", "barra de proteina", "proteina", "suplemento"
+]
+
+# tokens promocionais: se aparecerem no título/descrição, tratamos como promo (podemos ignorar)
+PROMO_TOKENS = [
+    "oferta", "ofertas", "promo", "promoção", "promoções", "black friday", "desconto",
+    "% off", "off%", "cupom", "frete", "fretegratis", "frete grátis",
+    "flash sale", "imperdível", "super oferta", "mega oferta", "liquida", "liquidação",
+    "blackweek", "ofertaflash", "ofertaflash!"
 ]
 
 env_kw = os.getenv("FILTER_KEYWORDS")
@@ -77,98 +77,6 @@ if env_black:
     FILTER_BLACKLIST = [k.strip().lower() for k in env_black.split(",") if k.strip()]
 else:
     FILTER_BLACKLIST = DEFAULT_FILTER_BLACKLIST
-
-# ----------------- Helpers -----------------
-def _normalize_text(s: Optional[str]) -> str:
-    if not s:
-        return ""
-    s = s.lower()
-    s = unicodedata.normalize("NFKD", s)
-    s = s.encode("ascii", "ignore").decode("ascii")
-    s = " ".join(s.split())
-    return s
-
-# detecta se título/trecho contem tokens de promoção (se sim, rejeitar)
-def contains_promo_tokens(text: Optional[str]) -> bool:
-    if not text:
-        return False
-    plain = _normalize_text(text)
-    for t in PROMO_TOKENS:
-        if t in plain:
-            return True
-    # detecta padrões como "49% off" ou "-49%" etc
-    if re.search(r"\d{1,3}\s*%|\d{1,3}%", text):
-        return True
-    return False
-
-# retorna a path normalizada da url (para detectar keywords no link)
-def normalized_url_path(url: Optional[str]) -> str:
-    if not url:
-        return ""
-    try:
-        from urllib.parse import urlparse, unquote
-        p = urlparse(url)
-        path = (p.path or "") + (" " + (p.query or "") if p.query else "")
-        path = unquote(path)
-        path = re.sub(r"[^0-9a-zA-Zà-ÿ]", " ", path)
-        return " ".join(path.split()).lower()
-    except Exception:
-        return _normalize_text(url)
-
-# Relevância: AGORA exige presença de keyword de componente E ausência de promo tokens e blacklist
-def is_relevant_offer(title: Optional[str], extra_text: Optional[str], url: Optional[str]) -> bool:
-    # combine title, extra_text, and url path
-    combined_parts = []
-    if title:
-        combined_parts.append(title)
-    if extra_text:
-        combined_parts.append(extra_text)
-    url_path = normalized_url_path(url)
-    if url_path:
-        combined_parts.append(url_path)
-    combined = " ".join(combined_parts)
-    plain = _normalize_text(combined)
-
-    # 1) blacklist: se alguma palavra de blacklist aparece -> rejeitar
-    for b in FILTER_BLACKLIST:
-        if not b:
-            continue
-        if b in plain:
-            print(f"[Filtro] blacklist '{b}' encontrado -> REJEITADO. title='{(title or '')[:80]}' url='{(url or '')[:160]}'")
-            return False
-
-    # 2) promo tokens: se a área tem token de promo -> rejeitar
-    if contains_promo_tokens(combined):
-        print(f"[Filtro] token PROMO detectado -> REJEITADO. title='{(title or '')[:80]}' url='{(url or '')[:160]}'")
-        return False
-
-    # 3) keyword match: precisa encontrar ao menos uma keyword de COMPONENTE
-    found_kw = False
-    for kw in FILTER_KEYWORDS:
-        k = _normalize_text(kw)
-        if not k:
-            continue
-        if k in plain:
-            found_kw = True
-            break
-
-    if not found_kw:
-        print(f"[Filtro] nenhuma keyword de componente encontrada -> REJEITADO. title='{(title or '')[:80]}' url='{(url or '')[:160]}'")
-        return False
-
-    # passou todas as checagens
-    print(f"[Filtro] Oferta relevante (componente) encontrada -> ACEITO. title='{(title or '')[:80]}' url='{(url or '')[:160]}'")
-    return True
-
-def is_test_offer(title: Optional[str]) -> bool:
-    if not title:
-        return False
-    plain = _normalize_text(title)
-    test_markers = ["teste", "oferta de teste", "test offer", "dummy", "insert_test", "oferta teste"]
-    for t in test_markers:
-        if t in plain:
-            return True
-    return False
 
 # ----------------- DB helpers -----------------
 def init_db():
@@ -244,65 +152,57 @@ def stats_counts():
     conn.close()
     return total, posted, unposted
 
-# ----------------- Parsers / scrapers helpers -----------------
+# ----------------- Helpers & parsers -----------------
 PRICE_RE = re.compile(r"R\$\s?\d{1,3}(?:[\.\d{3}])*(?:,\d{2})?")
 COUPON_RE = re.compile(r"(?:cupom|código|codigo|code|coupon)[:\s]*([A-Z0-9\-]{4,16})", re.IGNORECASE)
 GENERIC_COUPON_RE = re.compile(r"\b([A-Z0-9]{4,10})\b")
+PRICE_RANGE_RE = re.compile(r"de\s*R\$\s?[\d\.\s,]+?\s*por\s*R\$\s?[\d\.\s,]+", re.IGNORECASE)
 
-async def fetch_text(url: str, session: ClientSession, timeout=20) -> Optional[str]:
-    try:
-        async with session.get(url, timeout=timeout) as resp:
-            if resp.status != 200:
-                print(f"fetch_text: {url} -> status {resp.status}")
-                return None
-            return await resp.text()
-    except Exception as e:
-        print("fetch_text error", url, e)
-        return None
+def _normalize_text(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    s = s.lower()
+    s = unicodedata.normalize("NFKD", s)
+    s = s.encode("ascii", "ignore").decode("ascii")
+    s = " ".join(s.split())
+    return s
 
-# fetch product title from page (og:title, h1, title, fallback)
-async def fetch_product_title(url: str, session: ClientSession, timeout=10) -> Optional[str]:
-    if not url:
-        return None
-    try:
-        async with session.get(url, timeout=timeout, headers={"User-Agent": "OfertasBot/1.0 (+contato)"}) as resp:
-            if resp.status != 200:
-                return None
-            html_text = await resp.text()
-    except Exception:
-        return None
+def contains_promo_tokens(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    plain = _normalize_text(text)
+    for tok in PROMO_TOKENS:
+        if tok and tok in plain:
+            return True
+    return False
 
-    try:
-        soup = BeautifulSoup(html_text, "html.parser")
-        og = soup.find("meta", property="og:title")
-        if og and og.get("content"):
-            val = clean_text(og.get("content"))
-            # NÃO aceitar se title da página for promocional
-            if val and not contains_promo_tokens(val):
-                return val
-        mtitle = soup.find("meta", attrs={"name": "title"})
-        if mtitle and mtitle.get("content"):
-            val = clean_text(mtitle.get("content"))
-            if val and not contains_promo_tokens(val):
-                return val
-        h1 = soup.find("h1")
-        if h1 and h1.get_text(strip=True):
-            val = clean_text(h1.get_text(" ", strip=True))
-            if val and not contains_promo_tokens(val):
-                return val
-        tit = soup.title
-        if tit and tit.string:
-            val = clean_text(tit.string)
-            if val and not contains_promo_tokens(val):
-                return val
-        h23 = soup.find(["h2", "h3"])
-        if h23 and h23.get_text(strip=True):
-            val = clean_text(h23.get_text(" ", strip=True))
-            if val and not contains_promo_tokens(val):
-                return val
-    except Exception:
-        return None
-    return None
+def is_relevant_offer(title: Optional[str], extra_text: Optional[str], url: Optional[str]) -> bool:
+    combined = " ".join(filter(None, [title or "", extra_text or "", url or ""]))
+    plain = _normalize_text(combined)
+    # blacklist
+    for b in FILTER_BLACKLIST:
+        if b and b in plain:
+            return False
+    # require at least one positive keyword
+    for kw in FILTER_KEYWORDS:
+        k = _normalize_text(kw)
+        if k and k in plain:
+            # also avoid promotional tokens dominating the text
+            if contains_promo_tokens(plain) and not any(k in t for t in [plain]):  # still allow if keyword clearly present
+                # we still pass because kw is present
+                pass
+            return True
+    return False
+
+def is_test_offer(title: Optional[str]) -> bool:
+    if not title:
+        return False
+    plain = _normalize_text(title)
+    test_markers = ["teste", "oferta de teste", "test offer", "dummy", "insert_test", "oferta teste", "oferta de teste automatica"]
+    for t in test_markers:
+        if t in plain:
+            return True
+    return False
 
 def clean_text(t: Optional[str]) -> Optional[str]:
     if not t:
@@ -319,16 +219,13 @@ def extract_price_from_text(text: str) -> Optional[str]:
     m = PRICE_RE.search(txt)
     return m.group(0).replace("\xa0", " ").strip() if m else None
 
-PRICE_RANGE_RE = re.compile(r"de\s*R\$\s?[\d\.\s,]+?\s*por\s*R\$\s?[\d\.\s,]+", re.IGNORECASE)
-
 def extract_price_range(text: Optional[str]) -> Optional[str]:
     if not text:
         return None
     txt = text.replace("\xa0", " ")
     m = PRICE_RANGE_RE.search(txt)
     if m:
-        pr = m.group(0)
-        return " ".join(pr.split()).strip()
+        return " ".join(m.group(0).split())
     return extract_price_from_text(txt)
 
 def detect_coupon(text: str) -> Optional[str]:
@@ -421,6 +318,59 @@ def find_link_title_image(elem, base_url: Optional[str] = None):
 
     return title, link, image
 
+# ----------------- HTTP helpers -----------------
+async def fetch_text(url: str, session: ClientSession, timeout=20) -> Optional[str]:
+    try:
+        async with session.get(url, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            return await resp.text()
+    except Exception:
+        return None
+
+# tenta extrair título real da página (og:title, meta title, h1, title)
+async def fetch_product_title(url: str, session: ClientSession, timeout=10) -> Optional[str]:
+    if not url:
+        return None
+    try:
+        async with session.get(url, timeout=timeout, headers={"User-Agent": "OfertasBot/1.0 (+contato)"}) as resp:
+            if resp.status != 200:
+                return None
+            html_text = await resp.text()
+    except Exception:
+        return None
+
+    try:
+        soup = BeautifulSoup(html_text, "html.parser")
+        og = soup.find("meta", property="og:title")
+        if og and og.get("content"):
+            val = clean_text(og.get("content"))
+            if val and not contains_promo_tokens(val):
+                return val
+        mtitle = soup.find("meta", attrs={"name": "title"})
+        if mtitle and mtitle.get("content"):
+            val = clean_text(mtitle.get("content"))
+            if val and not contains_promo_tokens(val):
+                return val
+        h1 = soup.find("h1")
+        if h1 and h1.get_text(strip=True):
+            val = clean_text(h1.get_text(" ", strip=True))
+            if val and not contains_promo_tokens(val):
+                return val
+        tit = soup.title
+        if tit and tit.string:
+            val = clean_text(tit.string)
+            if val and not contains_promo_tokens(val):
+                return val
+        h23 = soup.find(["h2", "h3"])
+        if h23 and h23.get_text(strip=True):
+            val = clean_text(h23.get_text(" ", strip=True))
+            if val and not contains_promo_tokens(val):
+                return val
+    except Exception:
+        return None
+    return None
+
 # ----------------- Collectors -----------------
 async def collect_kabum(session: ClientSession):
     urls = [
@@ -448,15 +398,16 @@ async def collect_kabum(session: ClientSession):
             title, link, image = find_link_title_image(block, base_url=page)
             if not link:
                 continue
-            # tenta buscar título real se título do bloco parecer promocional genérico
-            if contains_promo_tokens(title):
-                real_title = await fetch_product_title(link, session)
-                if real_title:
-                    print("Kabum: substituiu título promocional ->", title, "->", real_title)
-                    title = real_title
             if link in seen:
                 continue
             seen.add(link)
+
+            # se o título parecer genérico/promocional, tenta buscar título real
+            if contains_promo_tokens(title):
+                real_title = await fetch_product_title(link, session)
+                if real_title:
+                    title = real_title
+
             price = extract_price_from_text(block.get_text(" ", strip=True) or "")
             coupon = detect_coupon(block.get_text(" ", strip=True) or "")
             if price:
@@ -464,10 +415,10 @@ async def collect_kabum(session: ClientSession):
             if not title:
                 title = clean_text(link.split("/")[-1].replace("-", " ").replace(".html", ""))
             extra_text = block.get_text(" ", strip=True) if block else ""
-            # Ao inserir, EXIGIMOS que seja relevante (component) — is_relevant_offer faz tudo
+            # só insere se for relevante (component)
             if is_relevant_offer(title, extra_text, link):
-                if insert_offer("kabum", title or "Oferta Kabum", link, price=price, shop="KaBuM", image_url=image, coupon=coupon):
-                    print("Kabum -> inserida:", title, price, link, "coupon:", coupon)
+                if insert_offer("kabum", title or "Componente Kabum", link, price=price, shop="KaBuM", image_url=image, coupon=coupon):
+                    print("Kabum -> inserida:", title, price, link)
             else:
                 print("Ignorada pelo filtro (Kabum):", title, link)
 
@@ -497,15 +448,15 @@ async def collect_pichau(session: ClientSession):
             title, link, image = find_link_title_image(block, base_url=page)
             if not link:
                 continue
-            # tenta buscar título real se título do bloco parecer promocional genérico
-            if contains_promo_tokens(title):
-                real_title = await fetch_product_title(link, session)
-                if real_title:
-                    print("Pichau: substituiu título promocional ->", title, "->", real_title)
-                    title = real_title
             if link in seen:
                 continue
             seen.add(link)
+
+            if contains_promo_tokens(title):
+                real_title = await fetch_product_title(link, session)
+                if real_title:
+                    title = real_title
+
             price = extract_price_from_text(block.get_text(" ", strip=True) or "")
             coupon = detect_coupon(block.get_text(" ", strip=True) or "")
             if price:
@@ -514,8 +465,8 @@ async def collect_pichau(session: ClientSession):
                 title = clean_text(link.split("/")[-1].replace("-", " ").replace(".html", ""))
             extra_text = block.get_text(" ", strip=True) if block else ""
             if is_relevant_offer(title, extra_text, link):
-                if insert_offer("pichau", title or "Oferta Pichau", link, price=price, shop="Pichau", image_url=image, coupon=coupon):
-                    print("Pichau -> inserida:", title, price, link, "coupon:", coupon)
+                if insert_offer("pichau", title or "Componente Pichau", link, price=price, shop="Pichau", image_url=image, coupon=coupon):
+                    print("Pichau -> inserida:", title, price, link)
             else:
                 print("Ignorada pelo filtro (Pichau):", title, link)
 
@@ -548,15 +499,15 @@ async def collect_amazon(session: ClientSession):
             link = urljoin(page, link)
             if link in seen:
                 continue
-            # title do anchor (pode ser genérico)
+            seen.add(link)
             title = a.get_text(strip=True) or (a.find("img") and a.find("img").get("alt")) or None
             title = clean_text(title) if title else None
-            # tenta buscar título real se parecer promocional
+
             if contains_promo_tokens(title):
                 real_title = await fetch_product_title(link, session)
                 if real_title:
-                    print("Amazon: substituiu título promocional ->", title, "->", real_title)
                     title = real_title
+
             image = None
             img = a.find("img")
             if img and img.get("src"):
@@ -567,8 +518,8 @@ async def collect_amazon(session: ClientSession):
                 price = price.replace("R$", "R$ ").strip()
             extra_text = block.get_text(" ", strip=True) if block else ""
             if is_relevant_offer(title, extra_text, link):
-                if price and insert_offer("amazon", title or "Oferta Amazon", link, price=price, shop="Amazon", image_url=image, coupon=coupon):
-                    print("Amazon -> inserida:", title, price, link, "coupon:", coupon)
+                if price and insert_offer("amazon", title or "Componente Amazon", link, price=price, shop="Amazon", image_url=image, coupon=coupon):
+                    print("Amazon -> inserida:", title, price, link)
             else:
                 print("Ignorada pelo filtro (Amazon):", title, link)
 
@@ -590,12 +541,10 @@ async def collector_job():
 # ----------------- Posting with image, buttons, affiliate -----------------
 def make_offer_keyboard(original_url: str, shop: Optional[str]):
     link = apply_affiliate(original_url, shop)
-    keyboard = [
-        [InlineKeyboardButton("Ver oferta 🛍️", url=link)]
-    ]
+    keyboard = [[InlineKeyboardButton("Ver oferta 🛍️", url=link)]]
     return InlineKeyboardMarkup(keyboard)
 
-# Title cleaning helpers (removes glued prices etc.)
+# --- Title cleaner: remove glued prices and fix spacing ---
 _PRICE_TOKENS_RE = re.compile(r"(de\s*R\$\s?[\d\.\s,]+?\s*por\s*R\$\s?[\d\.\s,]+|R\$\s?[\d\.\s,]+)", flags=re.IGNORECASE)
 _PCT_NO_SPACE_RE = re.compile(r"%(?=\S)")
 _CAMEL_SPLIT_RE = re.compile(r"(?<=[a-zà-ÿ])(?=[A-Z])")
@@ -618,10 +567,11 @@ def clean_title_for_display(raw_title: Optional[str], price_text: Optional[str])
     t = t.strip(" -–—:;/")
     return t if t else (raw_title or "Componente")
 
+# --- Posting loop (mensagem curta) ---
 async def post_offers_loop(bot: Bot):
     """
     Formato curto:
-    🔥 OFERTA: <nome do produto>   <-- mantemos 'OFERTA' para familiaridade, mas postamos só componentes
+    🔥 OFERTA: <nome do produto>
     💸 Preço: ...
     🏷️ Loja: ...
     """
@@ -635,33 +585,33 @@ async def post_offers_loop(bot: Bot):
             for offer in to_post:
                 title = (offer.get("title") or "").strip()
                 url = offer.get("url") or ""
+
                 # ignore test offers
                 if is_test_offer(title):
-                    print("Oferta de teste detectada — marcando como postada:", title, url)
                     mark_as_posted(offer["id"])
+                    print("Oferta de teste ignorada:", title, url)
                     continue
 
-                # double-check relevance (must be component & no promo tokens)
-                extra_text = ""  # not stored; if needed add to DB
+                # double-check relevance
+                extra_text = ""
                 if not is_relevant_offer(title, extra_text, url):
-                    print("Ignorado por relevância (dupla checagem):", title, url)
                     mark_as_posted(offer["id"])
+                    print("Ignorado por relevância (dupla checagem):", title, url)
                     continue
 
-                # require price
+                # price required
                 comb_text = " ".join(filter(None, [title, offer.get("price") or ""]))
                 price_text = extract_price_range(comb_text)
                 if not price_text:
-                    print("Ignorado sem preço detectado — marcando como postado:", title, url)
                     mark_as_posted(offer["id"])
+                    print("Ignorado sem preço detectado:", title, url)
                     continue
 
-                # clean title and ensure it doesn't contain promo tokens
+                # clean title
                 clean_title = clean_title_for_display(title, price_text)
                 if contains_promo_tokens(clean_title):
-                    # se, por algum motivo, o título limpo ainda tem promo token, ignora
-                    print("Título limpo contém token promocional — ignorando:", clean_title, url)
                     mark_as_posted(offer["id"])
+                    print("Título limpo contém token promocional — ignorando:", clean_title, url)
                     continue
 
                 safe_title = clean_title.replace("`", "").replace("[", "").replace("]", "").replace("*", "").strip()
@@ -674,17 +624,13 @@ async def post_offers_loop(bot: Bot):
                 ]
                 message = "\n".join(message_lines)
 
-                try:
-                    keyboard = make_offer_keyboard(url, offer.get("shop"))
-                except Exception:
-                    keyboard = None
+                keyboard = make_offer_keyboard(url, offer.get("shop"))
 
                 try:
                     if offer.get("image_url"):
                         try:
                             await bot.send_photo(chat_id=TARGET_CHAT_ID, photo=offer["image_url"], caption=message, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
-                        except TelegramError as te_photo:
-                            print("send_photo falhou, fallback para send_message:", te_photo)
+                        except TelegramError:
                             await bot.send_message(chat_id=TARGET_CHAT_ID, text=message, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                     else:
                         await bot.send_message(chat_id=TARGET_CHAT_ID, text=message, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
