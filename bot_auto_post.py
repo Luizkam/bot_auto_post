@@ -9,6 +9,7 @@ Versão turbinada do bot de ofertas:
 - roda um webserver mínimo para deploy em Web Service (Render)
 - filtra ofertas para postar apenas peças/componentes de computador
 - mensagens no formato curto solicitado e evita postar testes/itens sem preço
+- títulos limpos (remove preços grudados, ajusta espaços)
 """
 
 import os
@@ -107,7 +108,8 @@ def is_test_offer(title: Optional[str]) -> bool:
     if not title:
         return False
     plain = _normalize_text(title)
-    test_markers = ["teste", "oferta de teste", "test offer", "dummy", "oferta teste", "insert_test", "oferta de teste automática", "oferta de teste automática"]
+    test_markers = ["teste", "oferta de teste", "test offer", "dummy", "oferta teste",
+                    "insert_test", "oferta de teste automática", "oferta de teste automática"]
     for t in test_markers:
         if t in plain:
             return True
@@ -477,6 +479,45 @@ def make_offer_keyboard(original_url: str, shop: Optional[str]):
     ]
     return InlineKeyboardMarkup(keyboard)
 
+# --- Title cleaner: remove glued prices and fix spacing ---
+# patterns to remove price tokens from title
+_PRICE_TOKENS_RE = re.compile(r"(de\s*R\$\s?[\d\.\s,]+?\s*por\s*R\$\s?[\d\.\s,]+|R\$\s?[\d\.\s,]+)", flags=re.IGNORECASE)
+# insert space after % if missing
+_PCT_NO_SPACE_RE = re.compile(r"%(?=\S)")
+# split camel-like joins (lower->Upper)
+_CAMEL_SPLIT_RE = re.compile(r"(?<=[a-zà-ÿ])(?=[A-Z])")
+# split letter-digit and digit-letter boundaries
+_LETTER_DIGIT_RE = re.compile(r"(?<=[A-Za-zÀ-ÿ])(?=\d)|(?<=\d)(?=[A-Za-zÀ-ÿ])")
+
+def clean_title_for_display(raw_title: Optional[str], price_text: Optional[str]) -> str:
+    t = (raw_title or "").strip()
+    if not t:
+        return "Oferta"
+
+    # remove HTML entities and normalize spaces
+    t = html.unescape(t)
+    t = t.replace("\xa0", " ")
+    t = t.replace("\r", " ").replace("\n", " ")
+    t = " ".join(t.split())
+
+    # insert spaces in common bad joins
+    t = _PCT_NO_SPACE_RE.sub("% ", t)
+    t = _CAMEL_SPLIT_RE.sub(" ", t)
+    t = _LETTER_DIGIT_RE.sub(" ", t)
+
+    # remove price tokens and explicit "De: ..." fragments to avoid duplication in title
+    t = re.sub(r"\bDe:\s*", "", t, flags=re.IGNORECASE)
+    t = _PRICE_TOKENS_RE.sub("", t)
+
+    # collapse multiple spaces and trim
+    t = " ".join(t.split()).strip()
+
+    # remove leading/trailing punctuation like '-' ':' '/'
+    t = t.strip(" -–—:;/")
+
+    # final fallback
+    return t if t else (raw_title or "Oferta")
+
 # --- New: concise posting format and rules ---
 async def post_offers_loop(bot: Bot):
     """
@@ -502,14 +543,14 @@ async def post_offers_loop(bot: Bot):
                     mark_as_posted(offer["id"])
                     continue
 
-                # 2) Relevância já foi checada antes da inserção, mas checamos novamente por segurança
+                # 2) Relevância já foi checada antes da inserção, but double-check
                 extra_text = ""  # não temos descrição salvo; se quiser, adicione no DB
                 if not is_relevant_offer(title, extra_text, url):
                     print("Ignorado por relevância (dupla checagem):", title, url)
                     mark_as_posted(offer["id"])
                     continue
 
-                # 3) Detecta preço/fasixa; se não houver preço, marca como postado e ignora
+                # 3) Detecta preço/faixa; se não houver preço, marca como postado e ignora
                 comb_text = " ".join(filter(None, [title, offer.get("price") or ""]))
                 price_text = extract_price_range(comb_text)
                 if not price_text:
@@ -517,9 +558,11 @@ async def post_offers_loop(bot: Bot):
                     mark_as_posted(offer["id"])
                     continue
 
-                # 4) Monta mensagem curta
-                safe_title = title.replace("`", "").replace("[", "").replace("]", "").replace("*", "")
+                # 4) Monta mensagem curta com título limpo (remove preços grudados dentro do título)
+                clean_title = clean_title_for_display(title, price_text)
+                safe_title = clean_title.replace("`", "").replace("[", "").replace("]", "").replace("*", "").strip()
                 shop_name = (offer.get("shop") or "Loja").strip().capitalize()
+
                 message_lines = [
                     f"🔥 *OFERTA:* {safe_title}",
                     f"💸 *Preço:* {price_text}",
