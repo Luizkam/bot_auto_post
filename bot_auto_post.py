@@ -10,6 +10,7 @@ Versão turbinada do bot de ofertas:
 - filtra ofertas para postar apenas peças/componentes de computador
 - mensagens no formato curto solicitado e evita postar testes/itens sem preço
 - títulos limpos (remove preços grudados, ajusta espaços)
+- tenta buscar título real do produto na página quando o título do bloco for genérico
 """
 
 import os
@@ -37,7 +38,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID")
 DB_PATH = os.getenv("DB_PATH", "offers.db")
-POST_INTERVAL_SECONDS = int(os.getenv("POST_INTERVAL_SECONDS", 60 * 30))
+POST_INTERVAL_SECONDS = int(os.getenv("POST_INTERVAL_SECONDS", 60 * 20))
 AFF_AMAZON_TAG = os.getenv("AFF_AMAZON_TAG")
 AFF_KABUM = os.getenv("AFF_KABUM")
 AFF_PICHAU = os.getenv("AFF_PICHAU")
@@ -205,6 +206,56 @@ async def fetch_text(url: str, session: ClientSession, timeout=20) -> Optional[s
         print("fetch_text error", url, e)
         return None
 
+# ---------- New: fetch product title from product page ----------
+async def fetch_product_title(url: str, session: ClientSession, timeout=10) -> Optional[str]:
+    """
+    Tenta obter título "real" da página do produto (og:title, meta title, h1, title, h2/h3).
+    Retorna None se não conseguir.
+    """
+    if not url:
+        return None
+    try:
+        async with session.get(url, timeout=timeout, headers={"User-Agent": "OfertasBot/1.0 (+contato)"}) as resp:
+            if resp.status != 200:
+                return None
+            html_text = await resp.text()
+    except Exception:
+        return None
+
+    try:
+        soup = BeautifulSoup(html_text, "html.parser")
+        og = soup.find("meta", property="og:title")
+        if og and og.get("content"):
+            return clean_text(og.get("content"))
+        mtitle = soup.find("meta", attrs={"name": "title"})
+        if mtitle and mtitle.get("content"):
+            return clean_text(mtitle.get("content"))
+        h1 = soup.find("h1")
+        if h1 and h1.get_text(strip=True):
+            return clean_text(h1.get_text(" ", strip=True))
+        tit = soup.title
+        if tit and tit.string:
+            return clean_text(tit.string)
+        h23 = soup.find(["h2", "h3"])
+        if h23 and h23.get_text(strip=True):
+            return clean_text(h23.get_text(" ", strip=True))
+    except Exception:
+        return None
+    return None
+
+# ---------- New: detect generic titles ----------
+GENERIC_TITLE_RE = re.compile(r"\b(oferta|promo(ca|ç)ao|promo|black friday|flash sale|ofertas|oferta)\b", re.IGNORECASE)
+
+def looks_like_generic_title(title: Optional[str]) -> bool:
+    if not title:
+        return True
+    t = _normalize_text(title)
+    if len(t) < 8:
+        return True
+    if GENERIC_TITLE_RE.search(t):
+        return True
+    return False
+
 def clean_text(t: Optional[str]) -> Optional[str]:
     if not t:
         return None
@@ -351,6 +402,12 @@ async def collect_kabum(session: ClientSession):
             title, link, image = find_link_title_image(block, base_url=page)
             if not link:
                 continue
+            # tenta buscar título real se for genérico
+            if looks_like_generic_title(title):
+                real_title = await fetch_product_title(link, session)
+                if real_title:
+                    print("Kabum: título genérico substituído ->", title, "->", real_title)
+                    title = real_title
             if link in seen:
                 continue
             seen.add(link)
@@ -393,6 +450,12 @@ async def collect_pichau(session: ClientSession):
             title, link, image = find_link_title_image(block, base_url=page)
             if not link:
                 continue
+            # tenta buscar título real se for genérico
+            if looks_like_generic_title(title):
+                real_title = await fetch_product_title(link, session)
+                if real_title:
+                    print("Pichau: título genérico substituído ->", title, "->", real_title)
+                    title = real_title
             if link in seen:
                 continue
             seen.add(link)
@@ -438,9 +501,15 @@ async def collect_amazon(session: ClientSession):
             link = urljoin(page, link)
             if link in seen:
                 continue
-            seen.add(link)
+            # obtain initial title from anchor/text
             title = a.get_text(strip=True) or (a.find("img") and a.find("img").get("alt")) or None
             title = clean_text(title) if title else None
+            # tenta buscar título real se for genérico
+            if looks_like_generic_title(title):
+                real_title = await fetch_product_title(link, session)
+                if real_title:
+                    print("Amazon: título genérico substituído ->", title, "->", real_title)
+                    title = real_title
             image = None
             img = a.find("img")
             if img and img.get("src"):
