@@ -6,7 +6,8 @@ Versão turbinada do bot de ofertas:
 - detecta cupons heurísticos
 - aplica link de afiliado simples (via .env)
 - registra stats e expõe /stats e /health
-- roda um webserver mínimo para deploy em Web Service
+- roda um webserver mínimo para deploy em Web Service (Render)
+- filtra ofertas para postar apenas peças/componentes de computador
 """
 
 import os
@@ -15,6 +16,7 @@ import asyncio
 import hashlib
 import re
 import html
+import unicodedata
 from time import monotonic
 from datetime import datetime, timezone
 from typing import List, Dict, Optional
@@ -40,6 +42,63 @@ AFF_PICHAU = os.getenv("AFF_PICHAU")
 
 # Example fallback sources (you can edit)
 SOURCES = ["https://www.promodo.com.br/feed/"]
+
+# ----------------- FILTER (peças/componentes) -----------------
+# keywords that we accept (components). Editable via env FILTER_KEYWORDS (comma-separated)
+DEFAULT_FILTER_KEYWORDS = [
+    "placa de video", "placa de vídeo", "placa mãe", "placa mae", "motherboard",
+    "gpu", "rtx", "gtx", "radeon", "rx", "vga",
+    "ssd", "nvme", "m.2", "m2", "hd", "hdd",
+    "memoria ram", "memória ram", "ram", "ddr4", "ddr5",
+    "processador", "cpu", "cooler", "dissipador", "heatsink",
+    "fonte", "psu", "gabinete", "case", "ventoinha", "fan",
+    "placa de som", "placa de rede", "ssd nvme", "ssd sata", "ssd m2", "m.2 ssd"
+]
+
+# blacklist: words that force exclusion
+DEFAULT_FILTER_BLACKLIST = [
+    "notebook", "laptop", "monitor", "smartphone", "celular", "impressora",
+    "televis", "tv", "geladeira", "airfryer", "console", "cadeira", "cadeirão",
+    "game", "jogo", "figurine", "funko", "roupa", "sapato", "tênis", "tenis"
+]
+
+env_kw = os.getenv("FILTER_KEYWORDS")
+env_black = os.getenv("FILTER_BLACKLIST")
+if env_kw:
+    FILTER_KEYWORDS = [k.strip().lower() for k in env_kw.split(",") if k.strip()]
+else:
+    FILTER_KEYWORDS = DEFAULT_FILTER_KEYWORDS
+if env_black:
+    FILTER_BLACKLIST = [k.strip().lower() for k in env_black.split(",") if k.strip()]
+else:
+    FILTER_BLACKLIST = DEFAULT_FILTER_BLACKLIST
+
+def _normalize_text(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    s = s.lower()
+    s = unicodedata.normalize("NFKD", s)
+    s = s.encode("ascii", "ignore").decode("ascii")
+    s = " ".join(s.split())
+    return s
+
+def is_relevant_offer(title: Optional[str], extra_text: Optional[str], url: Optional[str]) -> bool:
+    combined = " ".join(filter(None, [title or "", extra_text or "", url or ""]))
+    plain = _normalize_text(combined)
+    # blacklist check
+    for b in FILTER_BLACKLIST:
+        if not b:
+            continue
+        if b in plain:
+            return False
+    # keywords check
+    for kw in FILTER_KEYWORDS:
+        k = _normalize_text(kw)
+        if not k:
+            continue
+        if k in plain:
+            return True
+    return False
 
 # ----------------- DB helpers -----------------
 def init_db():
@@ -124,7 +183,6 @@ async def fetch_text(url: str, session: ClientSession, timeout=20) -> Optional[s
     try:
         async with session.get(url, timeout=timeout) as resp:
             if resp.status != 200:
-                # debug log
                 print(f"fetch_text: {url} -> status {resp.status}")
                 return None
             return await resp.text()
@@ -273,8 +331,13 @@ async def collect_kabum(session: ClientSession):
                 price = price.replace("R$", "R$ ").strip()
             if not title:
                 title = clean_text(link.split("/")[-1].replace("-", " ").replace(".html", ""))
-            if insert_offer("kabum", title or "Oferta Kabum", link, price=price, shop="KaBuM", image_url=image, coupon=coupon):
-                print("Kabum -> inserida:", title, price, link, "coupon:", coupon)
+            # filtro de relevância
+            extra_text = block.get_text(" ", strip=True) if block else ""
+            if is_relevant_offer(title, extra_text, link):
+                if insert_offer("kabum", title or "Oferta Kabum", link, price=price, shop="KaBuM", image_url=image, coupon=coupon):
+                    print("Kabum -> inserida:", title, price, link, "coupon:", coupon)
+            else:
+                print("Ignorada pelo filtro (Kabum):", title, link)
 
 async def collect_pichau(session: ClientSession):
     urls = [
@@ -311,8 +374,13 @@ async def collect_pichau(session: ClientSession):
                 price = price.replace("R$", "R$ ").strip()
             if not title:
                 title = clean_text(link.split("/")[-1].replace("-", " ").replace(".html", ""))
-            if insert_offer("pichau", title or "Oferta Pichau", link, price=price, shop="Pichau", image_url=image, coupon=coupon):
-                print("Pichau -> inserida:", title, price, link, "coupon:", coupon)
+            # filtro de relevância
+            extra_text = block.get_text(" ", strip=True) if block else ""
+            if is_relevant_offer(title, extra_text, link):
+                if insert_offer("pichau", title or "Oferta Pichau", link, price=price, shop="Pichau", image_url=image, coupon=coupon):
+                    print("Pichau -> inserida:", title, price, link, "coupon:", coupon)
+            else:
+                print("Ignorada pelo filtro (Pichau):", title, link)
 
 async def collect_amazon(session: ClientSession):
     pages = [
@@ -354,8 +422,13 @@ async def collect_amazon(session: ClientSession):
             coupon = detect_coupon(block.get_text(" ", strip=True) or "")
             if price:
                 price = price.replace("R$", "R$ ").strip()
-            if price and insert_offer("amazon", title or "Oferta Amazon", link, price=price, shop="Amazon", image_url=image, coupon=coupon):
-                print("Amazon -> inserida:", title, price, link, "coupon:", coupon)
+            # filtro de relevância
+            extra_text = block.get_text(" ", strip=True) if block else ""
+            if is_relevant_offer(title, extra_text, link):
+                if price and insert_offer("amazon", title or "Oferta Amazon", link, price=price, shop="Amazon", image_url=image, coupon=coupon):
+                    print("Amazon -> inserida:", title, price, link, "coupon:", coupon)
+            else:
+                print("Ignorada pelo filtro (Amazon):", title, link)
 
 # ----------------- collector job -----------------
 async def collector_job():
@@ -402,7 +475,6 @@ async def post_offers_loop(bot: Bot):
                 keyboard = make_offer_keyboard(offer['url'], offer.get("shop"))
                 try:
                     if offer.get("image_url"):
-                        # send photo - fallback to message if fails
                         try:
                             await bot.send_photo(chat_id=TARGET_CHAT_ID, photo=offer['image_url'], caption=caption, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                         except TelegramError as te_photo:
