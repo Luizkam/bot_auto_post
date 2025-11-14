@@ -3,11 +3,12 @@
 Versão turbinada do bot de ofertas:
 - envia imagens quando disponíveis
 - inclui InlineKeyboard com botões
-- detecta cupons heurísticos
+- detecta cupons heurísticos (não exibidos nas mensagens)
 - aplica link de afiliado simples (via .env)
 - registra stats e expõe /stats e /health
 - roda um webserver mínimo para deploy em Web Service (Render)
 - filtra ofertas para postar apenas peças/componentes de computador
+- mensagens no formato curto solicitado e evita postar testes/itens sem preço
 """
 
 import os
@@ -44,7 +45,6 @@ AFF_PICHAU = os.getenv("AFF_PICHAU")
 SOURCES = ["https://www.promodo.com.br/feed/"]
 
 # ----------------- FILTER (peças/componentes) -----------------
-# keywords that we accept (components). Editable via env FILTER_KEYWORDS (comma-separated)
 DEFAULT_FILTER_KEYWORDS = [
     "placa de video", "placa de vídeo", "placa mãe", "placa mae", "motherboard",
     "gpu", "rtx", "gtx", "radeon", "rx", "vga",
@@ -55,11 +55,11 @@ DEFAULT_FILTER_KEYWORDS = [
     "placa de som", "placa de rede", "ssd nvme", "ssd sata", "ssd m2", "m.2 ssd"
 ]
 
-# blacklist: words that force exclusion
 DEFAULT_FILTER_BLACKLIST = [
     "notebook", "laptop", "monitor", "smartphone", "celular", "impressora",
     "televis", "tv", "geladeira", "airfryer", "console", "cadeira", "cadeirão",
-    "game", "jogo", "figurine", "funko", "roupa", "sapato", "tênis", "tenis"
+    "game", "jogo", "figurine", "funko", "roupa", "sapato", "tênis", "tenis",
+    "power bank", "powerbank", "barra de proteina", "proteina", "suplemento"
 ]
 
 env_kw = os.getenv("FILTER_KEYWORDS")
@@ -97,6 +97,19 @@ def is_relevant_offer(title: Optional[str], extra_text: Optional[str], url: Opti
         if not k:
             continue
         if k in plain:
+            return True
+    return False
+
+def is_test_offer(title: Optional[str]) -> bool:
+    """
+    Detecta ofertas de teste/placeholder pelo título.
+    """
+    if not title:
+        return False
+    plain = _normalize_text(title)
+    test_markers = ["teste", "oferta de teste", "test offer", "dummy", "oferta teste", "insert_test", "oferta de teste automática", "oferta de teste automática"]
+    for t in test_markers:
+        if t in plain:
             return True
     return False
 
@@ -204,6 +217,20 @@ def extract_price_from_text(text: str) -> Optional[str]:
     txt = text.replace("\xa0", " ")
     m = PRICE_RE.search(txt)
     return m.group(0).replace("\xa0", " ").strip() if m else None
+
+# --- New: detect price range like "de R$ X por R$ Y" or fallback to single price
+PRICE_RANGE_RE = re.compile(r"de\s*R\$\s?[\d\.\s,]+?\s*por\s*R\$\s?[\d\.\s,]+", re.IGNORECASE)
+
+def extract_price_range(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    txt = text.replace("\xa0", " ")
+    m = PRICE_RANGE_RE.search(txt)
+    if m:
+        pr = m.group(0)
+        return " ".join(pr.split()).strip()
+    # fallback to single price
+    return extract_price_from_text(txt)
 
 def detect_coupon(text: str) -> Optional[str]:
     if not text:
@@ -331,7 +358,6 @@ async def collect_kabum(session: ClientSession):
                 price = price.replace("R$", "R$ ").strip()
             if not title:
                 title = clean_text(link.split("/")[-1].replace("-", " ").replace(".html", ""))
-            # filtro de relevância
             extra_text = block.get_text(" ", strip=True) if block else ""
             if is_relevant_offer(title, extra_text, link):
                 if insert_offer("kabum", title or "Oferta Kabum", link, price=price, shop="KaBuM", image_url=image, coupon=coupon):
@@ -374,7 +400,6 @@ async def collect_pichau(session: ClientSession):
                 price = price.replace("R$", "R$ ").strip()
             if not title:
                 title = clean_text(link.split("/")[-1].replace("-", " ").replace(".html", ""))
-            # filtro de relevância
             extra_text = block.get_text(" ", strip=True) if block else ""
             if is_relevant_offer(title, extra_text, link):
                 if insert_offer("pichau", title or "Oferta Pichau", link, price=price, shop="Pichau", image_url=image, coupon=coupon):
@@ -422,7 +447,6 @@ async def collect_amazon(session: ClientSession):
             coupon = detect_coupon(block.get_text(" ", strip=True) or "")
             if price:
                 price = price.replace("R$", "R$ ").strip()
-            # filtro de relevância
             extra_text = block.get_text(" ", strip=True) if block else ""
             if is_relevant_offer(title, extra_text, link):
                 if price and insert_offer("amazon", title or "Oferta Amazon", link, price=price, shop="Amazon", image_url=image, coupon=coupon):
@@ -449,45 +473,84 @@ async def collector_job():
 def make_offer_keyboard(original_url: str, shop: Optional[str]):
     link = apply_affiliate(original_url, shop)
     keyboard = [
-        [InlineKeyboardButton("Ver oferta 🔗", url=link)],
-        [InlineKeyboardButton("Ir para loja 🛒", url=original_url)]
+        [InlineKeyboardButton("Ver oferta 🛍️", url=link)]
     ]
     return InlineKeyboardMarkup(keyboard)
 
+# --- New: concise posting format and rules ---
 async def post_offers_loop(bot: Bot):
+    """
+    Posta ofertas em formato curto:
+    🔥 OFERTA: nome do produto
+    💸 Preço: de R$... por R$...  (ou preço único)
+    🏷️ Loja: Amazon
+    [Botão Ver oferta]
+    """
     while True:
         try:
             to_post = get_unposted_offers(limit=10)
             if not to_post:
                 await asyncio.sleep(10)
                 continue
+
             for offer in to_post:
-                safe_title = (offer['title'] or "").replace("`", "").replace("[", "").replace("]", "").replace("*", "")
-                text_lines = [f"*{safe_title}*"]
-                if offer.get("price"):
-                    text_lines.append(f"Preço: {offer['price']}")
-                if offer.get("shop"):
-                    text_lines.append(f"Loja: {offer['shop']}")
-                if offer.get("coupon"):
-                    text_lines.append(f"💥 Cupom: `{offer['coupon']}`")
-                text_lines.append(offer['url'])
-                caption = "\n".join(text_lines)
-                keyboard = make_offer_keyboard(offer['url'], offer.get("shop"))
+                title = (offer.get("title") or "").strip()
+                url = offer.get("url") or ""
+                # 1) Ignora e marca ofertas de teste
+                if is_test_offer(title):
+                    print("Oferta de teste detectada — marcando como postada para ignorar:", title, url)
+                    mark_as_posted(offer["id"])
+                    continue
+
+                # 2) Relevância já foi checada antes da inserção, mas checamos novamente por segurança
+                extra_text = ""  # não temos descrição salvo; se quiser, adicione no DB
+                if not is_relevant_offer(title, extra_text, url):
+                    print("Ignorado por relevância (dupla checagem):", title, url)
+                    mark_as_posted(offer["id"])
+                    continue
+
+                # 3) Detecta preço/fasixa; se não houver preço, marca como postado e ignora
+                comb_text = " ".join(filter(None, [title, offer.get("price") or ""]))
+                price_text = extract_price_range(comb_text)
+                if not price_text:
+                    print("Ignorado sem preço detectado — marcando como postado:", title, url)
+                    mark_as_posted(offer["id"])
+                    continue
+
+                # 4) Monta mensagem curta
+                safe_title = title.replace("`", "").replace("[", "").replace("]", "").replace("*", "")
+                shop_name = (offer.get("shop") or "Loja").strip().capitalize()
+                message_lines = [
+                    f"🔥 *OFERTA:* {safe_title}",
+                    f"💸 *Preço:* {price_text}",
+                    f"🏷️ *Loja:* {shop_name}"
+                ]
+                message = "\n".join(message_lines)
+
+                # 5) Botão com afiliado
+                try:
+                    btn_url = apply_affiliate(url, offer.get("shop"))
+                    keyboard = make_offer_keyboard(url, offer.get("shop"))
+                except Exception:
+                    keyboard = None
+
+                # 6) Envia (foto opcional) — legenda curta
                 try:
                     if offer.get("image_url"):
                         try:
-                            await bot.send_photo(chat_id=TARGET_CHAT_ID, photo=offer['image_url'], caption=caption, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+                            await bot.send_photo(chat_id=TARGET_CHAT_ID, photo=offer["image_url"], caption=message, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                         except TelegramError as te_photo:
-                            print("send_photo failed, falling back to send_message:", te_photo)
-                            await bot.send_message(chat_id=TARGET_CHAT_ID, text=caption, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+                            print("send_photo falhou, fallback para send_message:", te_photo)
+                            await bot.send_message(chat_id=TARGET_CHAT_ID, text=message, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                     else:
-                        await bot.send_message(chat_id=TARGET_CHAT_ID, text=caption, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+                        await bot.send_message(chat_id=TARGET_CHAT_ID, text=message, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                     mark_as_posted(offer["id"])
-                    print("Postado:", offer["title"])
+                    print("Postado (enxuto):", safe_title, url)
                     await asyncio.sleep(2)
                 except TelegramError as te:
                     print("Erro ao postar oferta:", te)
                     await asyncio.sleep(5)
+
             await asyncio.sleep(POST_INTERVAL_SECONDS)
         except Exception as e:
             print("Erro no post_offers_loop:", e)
