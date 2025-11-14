@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: ofertas-bot
+    repo: "https://github.com/Luizkam/bot_auto_post" # substitua
+    branch: main
+    env: docker
+    dockerfilePath: Dockerfile
+    plan: free
+    autoDeploy: true

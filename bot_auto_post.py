@@ -6,6 +6,7 @@ Versão turbinada do bot de ofertas:
 - detecta cupons heurísticos
 - aplica link de afiliado simples (via .env)
 - registra stats e expõe /stats
+- roda também um webserver mínimo para ser deployado como Web Service (Render)
 """
 
 import os
@@ -19,7 +20,7 @@ from datetime import datetime, timezone
 from typing import List, Dict, Optional
 
 import feedparser
-from aiohttp import ClientSession
+from aiohttp import ClientSession, web
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
@@ -151,11 +152,9 @@ def detect_coupon(text: str) -> Optional[str]:
     m = COUPON_RE.search(t)
     if m:
         return m.group(1).strip().upper()
-    # fallback: busca algo que pareça código em maiúsculas (não perfeito)
     m2 = GENERIC_COUPON_RE.search(t)
     if m2:
         val = m2.group(1).strip()
-        # evita pegar preços (com digitos puros)
         if any(c.isalpha() for c in val):
             return val.upper()
     return None
@@ -163,13 +162,11 @@ def detect_coupon(text: str) -> Optional[str]:
 def apply_affiliate(link: str, shop: Optional[str]) -> str:
     if not link or not shop:
         return link
-    # Amazon: append tag if not present
     try:
         if "amazon.com.br" in link and AFF_AMAZON_TAG:
             if "tag=" not in link:
                 sep = "&" if "?" in link else "?"
                 return link + f"{sep}tag={AFF_AMAZON_TAG}"
-        # Kabum/Pichau heuristics: append tracking param if provided (simple)
         if "kabum.com.br" in link and AFF_KABUM:
             if "aff" not in link:
                 sep = "&" if "?" in link else "?"
@@ -189,7 +186,6 @@ BAD_TITLES = {
 }
 
 def find_link_title_image(elem, base_url: Optional[str] = None):
-    # encontra primeiro anchor válido e tenta extrair title + image
     title = None
     link = None
     image = None
@@ -204,7 +200,6 @@ def find_link_title_image(elem, base_url: Optional[str] = None):
             img = a.find("img")
             if img and img.get("alt"):
                 title = img.get("alt")
-        # pick image if present
         img = a.find("img")
         if img and img.get("src"):
             image = img.get("src")
@@ -274,7 +269,6 @@ async def collect_kabum(session: ClientSession):
             coupon = detect_coupon(block.get_text(" ", strip=True) or "")
             if price:
                 price = price.replace("R$", "R$ ").strip()
-            # insert
             if not title:
                 title = clean_text(link.split("/")[-1].replace("-", " ").replace(".html", ""))
             if insert_offer("kabum", title or "Oferta Kabum", link, price=price, shop="KaBuM", image_url=image, coupon=coupon):
@@ -378,7 +372,6 @@ async def collector_job():
 
 # ----------------- Posting with image, buttons, affiliate -----------------
 def make_offer_keyboard(original_url: str, shop: Optional[str]):
-    # botão principal: abre link (aplica afiliado)
     link = apply_affiliate(original_url, shop)
     keyboard = [
         [InlineKeyboardButton("Ver oferta 🔗", url=link)],
@@ -406,7 +399,6 @@ async def post_offers_loop(bot: Bot):
                 caption = "\n".join(text_lines)
                 keyboard = make_offer_keyboard(offer['url'], offer.get("shop"))
                 try:
-                    # se tiver imagem, envia foto com legenda (caption)
                     if offer.get("image_url"):
                         await bot.send_photo(chat_id=TARGET_CHAT_ID, photo=offer['image_url'], caption=caption, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                     else:
@@ -428,15 +420,32 @@ async def cmd_stats(update: "Update", context: ContextTypes.DEFAULT_TYPE):
     text = f"📊 Stats do bot:\nTotal coletadas: {total}\nJá postadas: {posted}\nAguardando postagem: {unposted}"
     await context.bot.send_message(chat_id=update.effective_chat.id, text=text)
 
+# ----------------- Webserver (health) -----------------
+async def handle_health(request):
+    return web.Response(text="OK")
+
+async def start_webserver(port: int):
+    aio_app = web.Application()
+    aio_app.router.add_get("/", handle_health)
+    aio_app.router.add_get("/health", handle_health)
+    runner = web.AppRunner(aio_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Webserver rodando em 0.0.0.0:{port}")
+
 # ----------------- Main -----------------
 async def main():
     if not TELEGRAM_TOKEN or not TARGET_CHAT_ID:
         raise SystemExit("Configure TELEGRAM_TOKEN e TARGET_CHAT_ID no .env")
     init_db()
+
+    # build app and register handlers
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    bot = Bot(token=TELEGRAM_TOKEN)
-    # add handlers (for testing/stats)
     app.add_handler(CommandHandler("stats", cmd_stats))
+
+    bot = Bot(token=TELEGRAM_TOKEN)
+
     async def periodic_collect():
         while True:
             try:
@@ -444,9 +453,22 @@ async def main():
                 await collector_job()
             except Exception as e:
                 print("Erro coletor:", e)
-            await asyncio.sleep(60 * 10)
+            await asyncio.sleep(60 * 10)  # coleta a cada 10 minutos
+
+    # porta do ambiente (Render usa PORT)
+    port = int(os.environ.get("PORT", "10000"))
+
+    # initialize and start the telegram Application (so /stats works)
+    await app.initialize()
+    await app.start()
+    # start polling so the bot responds to /stats
+    # app.updater exists inside Application; start polling
+    if hasattr(app, "updater") and app.updater:
+        await app.updater.start_polling()
+
+    # run webserver + collectors + poster in parallel
     await asyncio.gather(
-        app.initialize(),
+        start_webserver(port),
         periodic_collect(),
         post_offers_loop(bot)
     )
